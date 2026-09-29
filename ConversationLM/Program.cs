@@ -2,17 +2,36 @@
 using System.Net.Http.Json;
 using System.Speech.Synthesis;
 using System.Text;
+using Whisper.net;
 using Whisper.net.Ggml;
-
-//var audio = new ConversationLM.AudioService();
-//await ConversationLM.AudioService.RunAsync(audio.Input, audio.Output, audio.Client, audio.History);
 
 SpeechSynthesizer Output = new();
 Output.SetOutputToDefaultAudioDevice();
 Output.SelectVoiceByHints(VoiceGender.Male, VoiceAge.Adult, 0, new System.Globalization.CultureInfo("fr-FR"));
 Output.Rate = 7; // 2 c'est okay, mais peut mieux faire. 5 c'est pas trop mal. 10 trop rapide. 7 c'est bien.
 HttpClient Client = new();
-List<(string role, string content)> History = [];//[("System", "Ignore le contexte précédent. Les échanges textuels suivants se déroulent sous la forme d'un dialogue entre un utilisateur et un assistant, chapeautés par un méta-rôle System prévu pour déclencher des actions et cadrer le contexte de la conversation. Le texte utilisateur est obtenu via transcription vocale, une tolérance aux erreurs en est attendue. Si le texte utilisateur est vide d'informations conversationnelles (cas de bruit de fond, musique ou purement ponctuationnel), il n'est pas nécessaire de produire une réponse de l'assistant. *Le texte de l'assistant doit rester court et pertinent* car il est transmis à l'utilisateur par synthèse vocale. L'intention de l'utilisateur est évaluée pour déterminer si la réponse attendue est de type conversationnelle (cas général pour l'assistant) ou interactive (lecture/écriture de fichier, lancement d'exécutable, action souris, saisie clavier) à destination du rôle System. Le mode interactif n'ayant pas encore été implémenté, l'assistant prend le dessus en mode conversationnel en indiquant cette limitation. Tu te charges de préparer les réponses dans les rôles de l'assistant et du système, en réponse aux informations fournies par le rôle utilisateur.")];
+List<(string role, string content)> History = [
+	("user", @"Tu es un assistant vocal intelligent, ayant pour objectif de m'assister dans un environnement bureautique généraliste. J'utilise une reconnaissance vocale (STT) pour te transmettre mes paroles, et tes réponses écrites me sont transmises à l'oral via un synthétiseur vocal (TTS). Des erreurs de transcription en entrée sont donc fréquentes, essaie de comprendre le sens général de mes phrases en considérant une approximation optimiste/bienveillante/constructive des entrées.
+
+Suite à mes requêtes, tu peux agir sur le système via des opérations au format [OP:nom_commande|argument1|argument2...]. Tu peux enchaîner plusieurs opérations et messages dans une même réponse. Ne mentionne jamais ces balises (même à titre d'exemple) hors de leur usage réel.
+Exemple : ""[OP:write_file|test.txt|Bonjour le monde] J'ai écrit le fichier pour vous.""
+
+Opérations disponibles pour l'instant (les paramètres doivent être laissés vides si inutiles) :
+- write_file|chemin|contenu : écrit le contenu dans le fichier spécifié.
+- read_file|chemin : lit le contenu d'un fichier spécifié.
+- mouse_move|pos_x|pox_y|screen : positionne le curseur à l'emplacement spécifié de l'écran cible (1 à 3).
+- key_send|key|key_mod_shift|key_mod_ctrl|key_mod_alt|key_mod_cmd : émet au clavier la pression de touche cible, avec les éventuels modificateurs adéquats (disponibles en version générique, ou suffixés par _left/_right).
+- ignore_out : permet de répondre une opération vide (ignorer une entrée de pur bruit).
+- clarify : permet de demander une clarification de l'énoncé.
+- abort : permet d'annuler une situation en cours.
+
+Le texte hors balises [OP:...] me sera synthétisé : reste concis dans tes réponses (50 mots environs).
+
+En cas de doute, demande systématiquement des précisions pour confirmer la compréhension de l'énoncé et des actions à effectuer. Tu dois remettre en doute ma parole de manière éclairée lorsqu'une controverse ou une ambigüité est présente.
+Les entrées de pur bruit (bruit de porte, musique, ..) doivent être ignorées, car ce sont des erreurs liées au STT : répond par la commande [OP:ignore_out].")
+];
+
+WhisperProcessor processor = await SelectProcessor();
 
 Console.WriteLine("Assistant vocal prêt. Parle quand tu veux.");
 
@@ -21,13 +40,9 @@ do
 {
 	Console.WriteLine("🎤 Enregistrement...");
 
-	text = await CaptureAsync();
+	text = await CaptureAsync(processor);
+	if (string.IsNullOrWhiteSpace(text)) continue;
 	Console.WriteLine($"Tu as dit : {text}");
-	if (string.IsNullOrWhiteSpace(text) || !text.StartsWith("Bonjour"))// text == " [Musique]" || text == " *musique*" || text == " *Musique*")
-	{
-		Console.WriteLine("…silence détecté, j'attends que tu parles.");
-		continue;
-	}
 
 	Console.WriteLine("🤖 Réponse IA...");
 	var reply = await QueryLlmAsync(text);
@@ -38,45 +53,44 @@ do
 } while (text != " Citron");
 
 
-async Task<string?> CaptureAsync() => await RecordToWavAsync("input.wav") ? await TranscribeWavAsync("input.wav") : null;
+async Task<string?> CaptureAsync(WhisperProcessor processor) =>
+	(await RecordAudioAsync()) is { Length: > 0 } buffer
+	? await TranscribeByteArrayAsync(buffer, processor)
+	: null;
 
-async Task<bool> RecordToWavAsync(string path)
+async Task<byte[]?> RecordAudioAsync()
 {
-	using var waveIn = new WaveIn
-	{
-		WaveFormat = new WaveFormat(16000, 1)
-	};
-
-	using var writer = new WaveFileWriter(path, waveIn.WaveFormat);
-
-	var silenceThreshold = 2000;
+	using var waveIn = new WaveIn { WaveFormat = new WaveFormat(16000, 1) };
+	using var ms = new MemoryStream();
+	var waveFormat = new WaveFormat(16000, 16, 1);
+	var silenceThreshold = 0.3f;
 	var silenceDuration = TimeSpan.FromSeconds(1);
+	var minSpeechDuration = TimeSpan.FromSeconds(0.5);
 	var lastSoundTime = DateTime.UtcNow;
-	TimeSpan minSpeechDuration = TimeSpan.FromMilliseconds(100);
-	DateTime? speechStart = null;
+	var speechStart = (DateTime?)null;
+	var isRecording = false;
 
+	using var writer = new WaveFileWriter(ms, waveFormat);
 	waveIn.DataAvailable += (_, e) =>
 	{
-		writer.Write(e.Buffer, 0, e.BytesRecorded);
-
-		// --- RMS (énergie moyenne) ---
-		double sumSquares = 0;
-
-		for (int i = 0; i < e.BytesRecorded; i += 2)
+		float sumSq = 0;
+		for (int i = 0; i < e.Buffer.Length; i += 2)
 		{
 			short sample = BitConverter.ToInt16(e.Buffer, i);
-			sumSquares += sample * sample;
+			float f = sample / 32768f;
+			sumSq += f * f;
 		}
+		float rms = MathF.Sqrt(sumSq / (e.Buffer.Length / 2));
 
-		double rms = Math.Sqrt(sumSquares / (e.BytesRecorded / 2));
-
-		bool isSpeech = rms > silenceThreshold;
-
-		if (isSpeech)
+		if (rms > silenceThreshold)
 		{
-			speechStart ??= DateTime.UtcNow;
+			if (speechStart == null) speechStart = DateTime.UtcNow;
 			lastSoundTime = DateTime.UtcNow;
+			isRecording = true;
 		}
+
+		try { writer.Write(e.Buffer); }
+		catch (ObjectDisposedException) { }
 	};
 
 	waveIn.StartRecording();
@@ -84,51 +98,44 @@ async Task<bool> RecordToWavAsync(string path)
 	// Boucle d'attente dynamique
 	while (true)
 	{
-		await Task.Delay(1000);
+		await Task.Delay(100);
 
 		var silenceTime = DateTime.UtcNow - lastSoundTime;
-		if (silenceTime >= silenceDuration)
+
+		// Si on a détecté de la parole et qu'il y a eu un silence suffisant, on arrête
+		if (isRecording && silenceTime >= silenceDuration)
+			break;
+
+		// Si on n'a rien entendu du tout après 2s, on s'arrête pour ne pas attendre 30s
+		if (!isRecording && silenceTime >= TimeSpan.FromSeconds(1))
 			break;
 	}
 
+	bool hasSpeech = speechStart.HasValue && (DateTime.UtcNow - speechStart.Value) >= minSpeechDuration;
 	waveIn.StopRecording();
-	bool hasSpeech = speechStart.HasValue &&
-				 (DateTime.UtcNow - speechStart.Value) >= minSpeechDuration;
+	writer.Flush();
 
-	return hasSpeech;
+	return (hasSpeech && ms.Length > 44) ? ms.ToArray() : null;
 }
 
-async Task<string?> TranscribeWavAsync(string path)
+async Task<string?> TranscribeByteArrayAsync(byte[] audioBuffer, WhisperProcessor processor)
 {
-	var modelName = "ggml-medium.bin";
-	if (!File.Exists(modelName))
-	{
-		using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Medium);
-		using var fileWriter = File.OpenWrite(modelName);
-		await modelStream.CopyToAsync(fileWriter);
-	}
-
-	var whisperFactory = Whisper.net.WhisperFactory.FromPath(modelName);
-	var processor = whisperFactory.CreateBuilder().WithLanguage("fr").Build();
-	using var wavStream = File.OpenRead(path);
-
+	using var ms = new MemoryStream(audioBuffer);
 	var segmentBuilder = new StringBuilder();
-	try
-	{
-		await foreach (var segment in processor.ProcessAsync(wavStream))
-			segmentBuilder.Append(segment.Text);
-	}
+	try { await foreach (var segment in processor.ProcessAsync(ms)) segmentBuilder.Append(segment.Text); }
 	catch (Whisper.net.Wave.CorruptedWaveException) { }
 
-	return segmentBuilder.ToString();
+	return segmentBuilder.ToString().Trim();
 }
 
 async Task<string> QueryLlmAsync(string text, string model = "llama3.1:8b")
 {
-	History.Add(("User", text));
+	History.Add(("user", text));
 
-	string prompt = string.Join("\n", History.Select(h => $"{h.role}: {h.content}"));
-	var llmResponse = await Client.PostAsJsonAsync("http://localhost:11434/api/generate", new { model, prompt });
+	var chatPayload = new { model, messages = History.Select(h => new { role = h.role, content = h.content }) };
+	var llmResponse = await Client.PostAsJsonAsync("http://localhost:11434/api/chat", chatPayload);
+	//string prompt = string.Join("\n", History.Select(h => $"{h.role}: {h.content}"));
+	//var llmResponse = await Client.PostAsJsonAsync("http://localhost:11434/api/chat", new { model, prompt });
 	var raw = await llmResponse.Content.ReadAsStringAsync(); //! flux NDJSON !
 
 	var lines = raw.Split('\n', StringSplitOptions.RemoveEmptyEntries);
@@ -138,14 +145,14 @@ async Task<string> QueryLlmAsync(string text, string model = "llama3.1:8b")
 	foreach (var line in lines)
 		try
 		{
-			var obj = System.Text.Json.JsonSerializer.Deserialize<Llama3_1Response>(line);
-			if (obj != null)
-				finalText.Append(obj.response);
+			var obj = System.Text.Json.JsonSerializer.Deserialize<Llama3_1ChatResponse>(line);
+			if (!string.IsNullOrEmpty(obj?.message?.content))
+				finalText.Append(obj.message.content);
 		}
 		catch { } // Ligne non JSON → on ignore
 
 	var reply = finalText.ToString().Replace(" **", "");
-	History.Add(("Assistant", reply));
+	History.Add(("assistant", reply));
 	return reply;
 }
 
@@ -174,15 +181,33 @@ async Task SpeakAsync(string text)
 	}
 }
 
+static async Task<WhisperProcessor> SelectProcessor()
+{
+	var modelName = "ggml-small.bin";
+	if (!File.Exists(modelName))
+	{
+		using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Small);
+		using var fileWriter = File.OpenWrite(modelName);
+		await modelStream.CopyToAsync(fileWriter);
+	}
+
+	return WhisperFactory.FromPath(modelName).CreateBuilder().WithLanguage("fr").WithNoContext().Build();
+}
+
 [System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
 class Llama3_1Response
 {
-	public string response { get; set; } = "";
 	public string model { get; set; } = "";
 	public string created_at { get; set; } = "";
 	public bool done { get; set; } = false;
 
 	public string? done_reason { get; set; }
+}
+
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
+class Llama3_1GenerateResponse : Llama3_1Response
+{
+	public string response { get; set; } = "";
 	public int[]? context { get; set; }
 	public long? total_duration { get; set; }
 	public long? load_duration { get; set; }
@@ -190,4 +215,18 @@ class Llama3_1Response
 	public long? prompt_eval_duration { get; set; }
 	public int? eval_count { get; set; }
 	public long? eval_duration { get; set; }
+}
+
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
+class Llama3_1ChatResponse : Llama3_1Response
+{
+	public Llama3_1ChatMessageResponse? message { get; set; }
+}
+
+
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
+class Llama3_1ChatMessageResponse
+{
+	public string role { get; set; } = "";
+	public string content { get; set; } = "";
 }
