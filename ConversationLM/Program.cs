@@ -76,7 +76,7 @@ MemoryStream _ms = new();
 Channel<byte[]> _speechChannel = Channel.CreateUnbounded<byte[]>();
 
 bool IsPaused = false;
-float _silenceThreshold = 0.1f;
+float _silenceThreshold = 0.2f;
 TimeSpan _silenceDuration = TimeSpan.FromSeconds(2);
 TimeSpan _minSpeechDuration = TimeSpan.FromSeconds(0.1);
 DateTime _lastSoundTime = DateTime.UtcNow;
@@ -239,10 +239,10 @@ async Task SpeakAsync(string text)
 
 static async Task<WhisperProcessor> SelectProcessor()
 {
-	var modelName = "ggml-small.bin";
+	var modelName = "ggml-medium.bin";
 	if (!File.Exists(modelName))
 	{
-		using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Small);
+		using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Medium);
 		using var fileWriter = File.OpenWrite(modelName);
 		await modelStream.CopyToAsync(fileWriter);
 	}
