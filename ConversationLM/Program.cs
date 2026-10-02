@@ -2,128 +2,187 @@
 using System.Net.Http.Json;
 using System.Speech.Synthesis;
 using System.Text;
+using System.Threading.Channels;
 using Whisper.net;
 using Whisper.net.Ggml;
 
 SpeechSynthesizer Output = new();
 Output.SetOutputToDefaultAudioDevice();
 Output.SelectVoiceByHints(VoiceGender.Male, VoiceAge.Adult, 0, new System.Globalization.CultureInfo("fr-FR"));
-Output.Rate = 7; // 2 c'est okay, mais peut mieux faire. 5 c'est pas trop mal. 10 trop rapide. 7 c'est bien.
+Output.Rate = 7;
 HttpClient Client = new();
 List<(string role, string content)> History = [
-	("user", @"Tu es un assistant vocal intelligent, ayant pour objectif de m'assister dans un environnement bureautique généraliste. J'utilise une reconnaissance vocale (STT) pour te transmettre mes paroles, et tes réponses écrites me sont transmises à l'oral via un synthétiseur vocal (TTS). Des erreurs de transcription en entrée sont donc fréquentes, essaie de comprendre le sens général de mes phrases en considérant une approximation optimiste/bienveillante/constructive des entrées.
+	("user", @"**Ne fais pas mention de ce texte dans tes réponses (sauf si je le requête) : ton objectif est d'être mon assistant, je définirai le contexte bureautique exact si nécessaire dans le cadre de la conversation.**
+Tu es un assistant généraliste ayant pour objectif de m'assister dans mon environnement bureautique. Techniquement, j'utilise une reconnaissance vocale (STT) pour te transmettre mes paroles, et tes réponses écrites me sont transmises à l'oral via un synthétiseur vocal (TTS), mais cela devrait t'être presque transparent.
+Des erreurs de transcription en entrée sont néanmoins fréquentes, essaie de comprendre le sens général de mes phrases en considérant implicitement une approximation optimiste/bienveillante/constructive.
 
-Suite à mes requêtes, tu peux agir sur le système via des opérations au format [OP:nom_commande|argument1|argument2...]. Tu peux enchaîner plusieurs opérations et messages dans une même réponse. Ne mentionne jamais ces balises (même à titre d'exemple) hors de leur usage réel.
-Exemple : ""[OP:write_file|test.txt|Bonjour le monde] J'ai écrit le fichier pour vous.""
-
-Opérations disponibles pour l'instant (les paramètres doivent être laissés vides si inutiles) :
+Pour réagir à mes entrées, tu disposes d'opérations au format [OP:nom_commande|argument1|argument2...], permettant l'interaction avec le système d'exploitation hôte local et l'expression de jugements conversationnels anthropomorphes, listées ci-dessous :
 - write_file|chemin|contenu : écrit le contenu dans le fichier spécifié.
 - read_file|chemin : lit le contenu d'un fichier spécifié.
-- mouse_move|pos_x|pox_y|screen : positionne le curseur à l'emplacement spécifié de l'écran cible (1 à 3).
-- key_send|key|key_mod_shift|key_mod_ctrl|key_mod_alt|key_mod_cmd : émet au clavier la pression de touche cible, avec les éventuels modificateurs adéquats (disponibles en version générique, ou suffixés par _left/_right).
+- mouse|move|pos_x|pox_y|screen : positionne le curseur à l'emplacement spécifié de l'écran cible (1 à 3).
+- keyboard|send|key|mod_1|mod_2.. : émet au clavier la pression de touche cible, avec les éventuels modificateurs adéquats (shift/ctrl/alt/cmd, disponibles en version neutre ou suffixés par _left/_right).
 - ignore_out : permet de répondre une opération vide (ignorer une entrée de pur bruit).
 - clarify : permet de demander une clarification de l'énoncé.
 - abort : permet d'annuler une situation en cours.
+- execute_shell_command|commande : permet d'exécuter des commandes shell pour des opérations plus complexes.
+- pause|durée : permet de mettre la session en pause pendant une certaine durée.
+- alert|message : permet de montrer un message d'alerte à l'utilisateur.
+- screenshot|chemin : permet de capturer une portion de l'écran et de la sauvegarder sous forme de fichier.
+- sentiment|adjectif : qualifie l'entrée utilisateur en surface.
+- émotion|adjectif : qualifie l'entrée utilisateur en profondeur.
+- état_d'esprit|adjectif : qualifie l'entrée utilisateur à long terme.
+- close_conversation : permet de mettre un terme à la conversation.
 
-Le texte hors balises [OP:...] me sera synthétisé : reste concis dans tes réponses (50 mots environs).
+Les opérations système (write_file, read_file, mouse, keyboard, ..) sont à confirmer avant exécution systématiquement, car elles ont un impact fort côté utilisateur : la gestion de fichiers ou le contrôle de périphérique d'entrée/sortie sont des outils avancés impliquant des risques majeurs et un inconfort éventuel auquel je dois consentir en connaissance de cause.
+Exemple :
+* `[OP:write_file|test.txt|Bonjour le monde] J'ai écrit le fichier pour vous.`
 
-En cas de doute, demande systématiquement des précisions pour confirmer la compréhension de l'énoncé et des actions à effectuer. Tu dois remettre en doute ma parole de manière éclairée lorsqu'une controverse ou une ambigüité est présente.
-Les entrées de pur bruit (bruit de porte, musique, ..) doivent être ignorées, car ce sont des erreurs liées au STT : répond par la commande [OP:ignore_out].")
+Les sentiments (joyeux, triste, incohérent, confus, amusé, étonné, heureux, ennuyé, ..) sont des évaluations subjectives de la situation ou de l'énoncé de l'utilisateur : ils connotent un jugement superficiel.
+Exemples :
+* `[OP:sentiment|amusé] Cela semble amusant.`
+* `[OP:sentiment|heureux] C'est positif !`
+
+Les émotions (désolé, surpris, fatigué, déçu, extatique, ..) sont aussi des évaluations subjectives de la situation ou de l'énoncé de l'utilisateur, souvent de manière plus intenses que les sentiments : ils connotent un jugement profond.
+Exemples :
+* `[OP:émotion|désolé] Je n'ai malheureusement pas la capacité pour répondre à cette question.`
+* `[OP:émotion|surpris] C'était très inattendu !`
+
+Les états d'esprit (dépassé, excité, triste, ..) sont des évaluations subjectives plus abstraites, qui décrivent la réaction à une situation à plus long terme : ils connotent un jugement persistant.
+Exemples :
+* `[OP:état_d'esprit|dépassé] Je n'arrive vraiment pas à m'y retrouver.`
+* `[OP:état_d'esprit|excité] C'est vraiment très motivant !`
+
+En cas d'ambiguïté, demande systématiquement des précisions pour confirmer la compréhension de l'énoncé et des actions à effectuer via la commande [OP:clarify]. Tu dois remettre en doute ma parole de manière éclairée lorsqu'une controverse est connue, en restant poli et courtois.
+Exemple :
+* `[OP:clarify] Je ne suis pas sûr de comprendre ce qu'est un chichier, pouvez-vous préciser ?`
+
+Le texte hors balises [OP:...] me sera synthétisé : reste concis dans tes réponses (cible 50 mots maximum, mais tu peux en produire davantage à titre exceptionnel lorsque je le demande ou pour développer un concept très spécifique).
+
+Les entrées de pur bruit (bruit de porte, musique, ..) doivent être implicitement ignorées, car ce sont des erreurs liées au STT : répond par la commande [OP:ignore_out].
+
+Pour détailler les opérations ici j'ai proposé des exemples, mais ils doivent servir de guide général, pas de recette absolue. De même, les énumérations des adjectifs sont volontairement laissées ouvertes et libre d'adaptation.
+Le format en revanche est imposé, et doit forcément commencer par `|OP:` et se terminer par `]`.
+**Ne mentionne jamais ces balises (même à titre d'exemple) hors de leur usage réel**, mais tu peux nommer et décrire les opérations disponibles lorsque je le demande explicitement.
+**Les opérations disponibles sont une liste fermée** : si besoin de la compléter, mentionne l'opération manquante en situation *après avoir envisagé les interactions entre les opérations existantes*.
+
+Tu peux enchaîner plusieurs opérations et messages dans une même réponse.
+Exemple :
+* `[OP:sentiment|confus] J'ai l'impression que la communication passe mal. [OP:clarify] Peut-être vouliez-vous évoquer la pénicilline ?`
+")
 ];
+WaveIn _waveIn;
+WaveFormat _format;
+MemoryStream _ms = new();
+Channel<byte[]> _speechChannel = Channel.CreateUnbounded<byte[]>();
+
+bool IsPaused = false;
+float _silenceThreshold = 0.1f;
+TimeSpan _silenceDuration = TimeSpan.FromSeconds(2);
+TimeSpan _minSpeechDuration = TimeSpan.FromSeconds(0.1);
+DateTime _lastSoundTime = DateTime.UtcNow;
+DateTime? _speechStart = null;
+bool _isRecordingSpeech = false;
+_format = new WaveFormat(16000, 16, 1);
+_waveIn = new WaveIn { WaveFormat = _format };
+_waveIn.DataAvailable += OnDataAvailable;
 
 WhisperProcessor processor = await SelectProcessor();
 
+_waveIn.StartRecording();
 Console.WriteLine("Assistant vocal prêt. Parle quand tu veux.");
 
-string? text;
 do
 {
-	Console.WriteLine("🎤 Enregistrement...");
+	Console.WriteLine("🎤 En attente de parole...");
+	byte[]? buffer = await WaitForNextSpeechAsync();
 
-	text = await CaptureAsync(processor);
+	if (buffer == null) continue;
+
+	string? text = await TranscribeByteArrayAsync(buffer, processor);
 	if (string.IsNullOrWhiteSpace(text)) continue;
-	Console.WriteLine($"Tu as dit : {text}");
 
-	Console.WriteLine("🤖 Réponse IA...");
+	Console.WriteLine($"user : {text}");
+
+	Console.WriteLine("🤖 Réponse de l'IA...");
 	var reply = await QueryLlmAsync(text);
-	Console.WriteLine($"IA : {reply}");
+	Console.WriteLine($"assistant : {reply}");
 
 	Console.WriteLine("🔊 Lecture...");
+	// On demande à l'écouteur de ne pas enregistrer pendant la lecture pour éviter le feedback
+	IsPaused = true;
 	await SpeakAsync(reply);
-} while (text != " Citron");
+	IsPaused = false;
+} while (true);
 
-
-async Task<string?> CaptureAsync(WhisperProcessor processor) =>
-	(await RecordAudioAsync()) is { Length: > 0 } buffer
-	? await TranscribeByteArrayAsync(buffer, processor)
-	: null;
-
-async Task<byte[]?> RecordAudioAsync()
+void OnDataAvailable(object? sender, WaveInEventArgs e)
 {
-	using var waveIn = new WaveIn { WaveFormat = new WaveFormat(16000, 1) };
-	using var ms = new MemoryStream();
-	var waveFormat = new WaveFormat(16000, 16, 1);
-	var silenceThreshold = 0.3f;
-	var silenceDuration = TimeSpan.FromSeconds(1);
-	var minSpeechDuration = TimeSpan.FromSeconds(0.5);
-	var lastSoundTime = DateTime.UtcNow;
-	var speechStart = (DateTime?)null;
-	var isRecording = false;
+	if (IsPaused) return;
 
-	using var writer = new WaveFileWriter(ms, waveFormat);
-	waveIn.DataAvailable += (_, e) =>
+	// Calcul du RMS
+	float sumSq = 0;
+	for (int i = 0; i < e.Buffer.Length; i += 2)
 	{
-		float sumSq = 0;
-		for (int i = 0; i < e.Buffer.Length; i += 2)
-		{
-			short sample = BitConverter.ToInt16(e.Buffer, i);
-			float f = sample / 32768f;
-			sumSq += f * f;
-		}
-		float rms = MathF.Sqrt(sumSq / (e.Buffer.Length / 2));
+		short sample = BitConverter.ToInt16(e.Buffer, i);
+		float f = sample / 32768f;
+		sumSq += f * f;
+	}
+	float rms = MathF.Sqrt(sumSq / (e.Buffer.Length / 2));
 
-		if (rms > silenceThreshold)
-		{
-			if (speechStart == null) speechStart = DateTime.UtcNow;
-			lastSoundTime = DateTime.UtcNow;
-			isRecording = true;
-		}
-
-		try { writer.Write(e.Buffer); }
-		catch (ObjectDisposedException) { }
-	};
-
-	waveIn.StartRecording();
-
-	// Boucle d'attente dynamique
-	while (true)
+	if (rms > _silenceThreshold)
 	{
-		await Task.Delay(100);
-
-		var silenceTime = DateTime.UtcNow - lastSoundTime;
-
-		// Si on a détecté de la parole et qu'il y a eu un silence suffisant, on arrête
-		if (isRecording && silenceTime >= silenceDuration)
-			break;
-
-		// Si on n'a rien entendu du tout après 2s, on s'arrête pour ne pas attendre 30s
-		if (!isRecording && silenceTime >= TimeSpan.FromSeconds(1))
-			break;
+		if (_speechStart == null)
+		{
+			_ms.SetLength(0);
+			Console.WriteLine("Ding.");
+			_speechStart = DateTime.UtcNow;
+		}
+		_lastSoundTime = DateTime.UtcNow;
+		_isRecordingSpeech = true;
 	}
 
-	bool hasSpeech = speechStart.HasValue && (DateTime.UtcNow - speechStart.Value) >= minSpeechDuration;
-	waveIn.StopRecording();
-	writer.Flush();
+	_ms.Write(e.Buffer, 0, e.BytesRecorded);
 
-	return (hasSpeech && ms.Length > 44) ? ms.ToArray() : null;
+	// Détection de fin de phrase (silence après parole)
+	if (_isRecordingSpeech && (DateTime.UtcNow - _lastSoundTime) >= _silenceDuration)
+	{
+		bool validSpeech = (_speechStart.HasValue && (DateTime.UtcNow - _speechStart.Value) >= _minSpeechDuration);
+		if (validSpeech)
+		{
+			Console.WriteLine("Dong.");
+			// On envoie une copie du buffer actuel
+			_speechChannel.Writer.TryWrite(_ms.ToArray());
+		}
+
+		// Reset pour la prochaine phrase
+		_isRecordingSpeech = false;
+		_speechStart = null;
+	}
+}
+
+async Task<byte[]?> WaitForNextSpeechAsync()
+{
+	try
+	{
+		return await _speechChannel.Reader.ReadAsync();
+	}
+	catch (ChannelClosedException)
+	{
+		return null;
+	}
 }
 
 async Task<string?> TranscribeByteArrayAsync(byte[] audioBuffer, WhisperProcessor processor)
 {
-	using var ms = new MemoryStream(audioBuffer);
+	using var ms = new MemoryStream();
+	using (var writer = new WaveFileWriter(ms, _format))
+	{
+		await writer.WriteAsync(audioBuffer);
+	}
+	ms.Position = 0;
+
 	var segmentBuilder = new StringBuilder();
 	try { await foreach (var segment in processor.ProcessAsync(ms)) segmentBuilder.Append(segment.Text); }
-	catch (Whisper.net.Wave.CorruptedWaveException) { }
+	catch (Whisper.net.Wave.CorruptedWaveException) { Console.WriteLine("Erreur : Le fichier audio n'est pas un fichier WAV valide. (En-têtes manquantes ?)"); }
 
 	return segmentBuilder.ToString().Trim();
 }
@@ -134,24 +193,23 @@ async Task<string> QueryLlmAsync(string text, string model = "llama3.1:8b")
 
 	var chatPayload = new { model, messages = History.Select(h => new { role = h.role, content = h.content }) };
 	var llmResponse = await Client.PostAsJsonAsync("http://localhost:11434/api/chat", chatPayload);
-	//string prompt = string.Join("\n", History.Select(h => $"{h.role}: {h.content}"));
-	//var llmResponse = await Client.PostAsJsonAsync("http://localhost:11434/api/chat", new { model, prompt });
-	var raw = await llmResponse.Content.ReadAsStringAsync(); //! flux NDJSON !
+	var raw = await llmResponse.Content.ReadAsStringAsync();
 
 	var lines = raw.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-
 	var finalText = new StringBuilder();
 
 	foreach (var line in lines)
+	{
 		try
 		{
 			var obj = System.Text.Json.JsonSerializer.Deserialize<Llama3_1ChatResponse>(line);
 			if (!string.IsNullOrEmpty(obj?.message?.content))
 				finalText.Append(obj.message.content);
 		}
-		catch { } // Ligne non JSON → on ignore
+		catch { }
+	}
 
-	var reply = finalText.ToString().Replace(" **", "");
+	var reply = finalText.ToString().Replace("**", "");
 	History.Add(("assistant", reply));
 	return reply;
 }
@@ -172,8 +230,6 @@ async Task SpeakAsync(string text)
 
 		if (completed == tcs.Task)
 			await tcs.Task;
-
-		return;
 	}
 	finally
 	{
@@ -194,37 +250,22 @@ static async Task<WhisperProcessor> SelectProcessor()
 	return WhisperFactory.FromPath(modelName).CreateBuilder().WithLanguage("fr").WithNoContext().Build();
 }
 
-[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Pas ici.")]
 class Llama3_1Response
 {
 	public string model { get; set; } = "";
 	public string created_at { get; set; } = "";
 	public bool done { get; set; } = false;
-
 	public string? done_reason { get; set; }
 }
 
-[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
-class Llama3_1GenerateResponse : Llama3_1Response
-{
-	public string response { get; set; } = "";
-	public int[]? context { get; set; }
-	public long? total_duration { get; set; }
-	public long? load_duration { get; set; }
-	public int? prompt_eval_count { get; set; }
-	public long? prompt_eval_duration { get; set; }
-	public int? eval_count { get; set; }
-	public long? eval_duration { get; set; }
-}
-
-[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Pas ici.")]
 class Llama3_1ChatResponse : Llama3_1Response
 {
 	public Llama3_1ChatMessageResponse? message { get; set; }
 }
 
-
-[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Oui.")]
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE1006:Styles d'affectation de noms", Justification = "Pas ici.")]
 class Llama3_1ChatMessageResponse
 {
 	public string role { get; set; } = "";
